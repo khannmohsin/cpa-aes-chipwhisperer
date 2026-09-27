@@ -7,3 +7,14 @@ chipwhisperer/
 # Python caches
 __pycache__/
 *.pyc
+
+# Packaging artifacts
+build/
+dist/
+*.egg-info/
+
+# Test and lint caches
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/

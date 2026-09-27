@@ -6,14 +6,20 @@ attack.py - Turn the CPA run into the three teaching artifacts:
 
 It loads the traces captured by capture.py and reuses the same correlation
 math as run_cpa_from_notebook.py (NewAE's tutorial CPA).
+
+The correlation core only needs numpy, so it can be imported and tested
+anywhere; matplotlib (plots) and tqdm (progress bar) are optional extras.
 """
 
+import argparse
 import os
+
 import numpy as np
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
-from tqdm import trange
+
+try:
+    from tqdm import trange
+except ImportError:          # tqdm is optional; a plain range is fine
+    trange = range
 
 DATA_DIR, RESULTS_DIR = "data", "results"
 ORANGE, GREY = "tab:orange", "lightgrey"
@@ -47,29 +53,47 @@ def aes_internal(pt_byte, key_byte):
     return sbox[pt_byte ^ key_byte]
 
 
-def correlate(traces, hyp):
+def correlate(traces, hyp, t_bar=None, o_t=None):
     """Pearson correlation of one hypothesis column against every trace sample.
 
     Returns one correlation per sample; we keep the largest absolute value.
+
+    Sample columns (or a hypothesis) with zero variance get a correlation of
+    0.0: a flat signal carries no information, and 0/0 would otherwise turn
+    into NaN, which poiisons the max() below and silently breaks the attack
+    (every key guess ends up NaN, argmax returns 0). t_bar / o_t may be
+    passed in when the caller already computed them (see byte_correlations).
     """
-    t_bar = np.mean(traces, axis=0)
-    o_t   = np.sqrt(np.sum((traces - t_bar) ** 2, axis=0))
+    if t_bar is None:
+        t_bar = np.mean(traces, axis=0)
+    if o_t is None:
+        o_t = np.sqrt(np.sum((traces - t_bar) ** 2, axis=0))
     h_bar = np.mean(hyp)
-    o_h   = np.sqrt(np.sum((hyp - h_bar) ** 2))
-    cov   = np.sum((traces - t_bar) * (hyp - h_bar)[:, None], axis=0)
-    return cov / (o_t * o_h)
+    o_h = np.sqrt(np.sum((hyp - h_bar) ** 2))
+    cov = np.sum((traces - t_bar) * (hyp - h_bar)[:, None], axis=0)
+    denom = o_t * o_h
+    corr = np.zeros_like(denom)
+    np.divide(cov, denom, out=corr, where=denom > 0)
+    return corr
 
 
 def byte_correlations(traces, plaintexts, bnum, ntraces=None):
-    """Best absolute correlation for each of the 256 guesses of key byte bnum."""
+    """Best absolute correlation for each of the 256 guesses of key byte bnum.
+
+    The trace mean and standard deviation do not depend on the key guess, so
+    they are computed once here and reused by correlate() for all 256
+    guesses (the same hoisting the NewAE tutorial does).
+    """
     if ntraces is None:
         ntraces = len(traces)
     t = traces[:ntraces]
     pt = plaintexts[:ntraces, bnum]
+    t_bar = np.mean(t, axis=0)
+    o_t = np.sqrt(np.sum((t - t_bar) ** 2, axis=0))
     best = np.zeros(256)
     for kguess in range(256):
         hyp = np.array([HW[aes_internal(p, kguess)] for p in pt], dtype=float)
-        best[kguess] = np.max(np.abs(correlate(t, hyp)))
+        best[kguess] = np.max(np.abs(correlate(t, hyp, t_bar, o_t)))
     return best
 
 
@@ -81,10 +105,26 @@ def recover_key(traces, plaintexts):
     return guess
 
 
-def write_key_report(recovered, real):
-    os.makedirs(RESULTS_DIR, exist_ok=True)
+def confirms_device(recovered, plaintexts, device_ciphertexts):
+    """Independent check: does the recovered key reproduce the chip's ciphertexts?
+
+    This trusts neither our stored key nor our CPA code. It encrypts each
+    plaintext with the recovered key using a separate AES library
+    (PyCryptodome) and compares to what the hardware really output.
+    """
+    from Crypto.Cipher import AES
+
+    cipher = AES.new(bytes(recovered), AES.MODE_ECB)
+    for pt, ct_device in zip(plaintexts, device_ciphertexts):
+        if cipher.encrypt(bytes(pt)) != ct_device:
+            return False
+    return True
+
+
+def write_key_report(recovered, real, results_dir=RESULTS_DIR):
+    os.makedirs(results_dir, exist_ok=True)
     match = np.array_equal(recovered, real)
-    with open(os.path.join(RESULTS_DIR, "recovered_key.txt"), "w") as f:
+    with open(os.path.join(results_dir, "recovered_key.txt"), "w") as f:
         f.write("Recovered key: " + bytes(recovered).hex() + "\n")
         f.write("Real key:      " + bytes(real).hex() + "\n")
         f.write("MATCH: " + ("yes" if match else "no") + "\n\n")
@@ -92,13 +132,25 @@ def write_key_report(recovered, real):
         for i in range(16):
             ok = "yes" if recovered[i] == real[i] else "NO"
             f.write(f"{i:4d}       {recovered[i]:02x}     {real[i]:02x}     {ok}\n")
-    print("wrote results/recovered_key.txt  (MATCH:", "yes)" if match else "no)")
+    print("wrote " + os.path.join(results_dir, "recovered_key.txt"),
+          " (MATCH:", "yes)" if match else "no)")
 
 
-def plot_correlation(traces, plaintexts, real):
+def _plt():
+    """matplotlib is only needed for the plots; import it lazily."""
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return plt
+
+
+def plot_correlation(traces, plaintexts, real, results_dir=RESULTS_DIR):
     """Byte 0: correlation of all 256 guesses, correct one highlighted."""
     corr = byte_correlations(traces, plaintexts, 0)
     correct = real[0]
+    plt = _plt()
     plt.figure(figsize=(10, 4), facecolor="white")
     plt.bar(range(256), corr, color=GREY, width=1.0)
     plt.bar([correct], [corr[correct]], color=ORANGE, width=2.0,
@@ -108,13 +160,16 @@ def plot_correlation(traces, plaintexts, real):
     plt.ylabel("Best absolute correlation")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "correlation_plot.png"), dpi=150)
+    plt.savefig(os.path.join(results_dir, "correlation_plot.png"), dpi=150)
     plt.close()
-    print("wrote results/correlation_plot.png")
+    print("wrote " + os.path.join(results_dir, "correlation_plot.png"))
 
 
-def plot_traces_needed(traces, plaintexts, real):
+def plot_traces_needed(traces, plaintexts, real, results_dir=RESULTS_DIR):
     """Byte 0: how the correct guess separates from the wrong ones as traces pile up."""
+    if len(traces) < 10:
+        print(f"fewer than 10 traces (have {len(traces)}); skipping traces_needed plot")
+        return
     counts = list(range(10, len(traces) + 1, 10))
     correct = real[0]
     correct_line, wrong_lines = [], []
@@ -124,6 +179,7 @@ def plot_traces_needed(traces, plaintexts, real):
         wrong = np.delete(corr, correct)
         wrong_lines.append(wrong)
 
+    plt = _plt()
     plt.figure(figsize=(10, 4), facecolor="white")
     for i in range(255):                       # every wrong guess, in grey
         plt.plot(counts, [w[i] for w in wrong_lines], color=GREY, linewidth=0.5)
@@ -134,21 +190,48 @@ def plot_traces_needed(traces, plaintexts, real):
     plt.ylabel("Best absolute correlation")
     plt.legend()
     plt.tight_layout()
-    plt.savefig(os.path.join(RESULTS_DIR, "traces_needed.png"), dpi=150)
+    plt.savefig(os.path.join(results_dir, "traces_needed.png"), dpi=150)
     plt.close()
-    print("wrote results/traces_needed.png")
+    print("wrote " + os.path.join(results_dir, "traces_needed.png"))
 
 
-def main():
-    traces     = np.load(os.path.join(DATA_DIR, "traces.npy"))
-    plaintexts = np.load(os.path.join(DATA_DIR, "plaintexts.npy"))
-    real       = np.load(os.path.join(DATA_DIR, "key.npy"))
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Correlation Power Analysis on captured AES-128 traces "
+                    "(ChipWhisperer-Lite teaching demo).",
+    )
+    parser.add_argument("--data-dir", default=DATA_DIR,
+                        help="folder with traces.npy, plaintexts.npy, key.npy "
+                             f"(default: {DATA_DIR})")
+    parser.add_argument("--results-dir", default=RESULTS_DIR,
+                        help="folder for the report and plots "
+                             f"(default: {RESULTS_DIR})")
+    parser.add_argument("--ntraces", type=int, default=None,
+                        help="use only the first N traces (default: all of them)")
+    parser.add_argument("--no-plots", action="store_true",
+                        help="skip the PNG plots, write the key report only")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    if args.ntraces is not None and args.ntraces <= 0:
+        raise SystemExit("--ntraces must be at least 1")
+    traces = np.load(os.path.join(args.data_dir, "traces.npy"))
+    plaintexts = np.load(os.path.join(args.data_dir, "plaintexts.npy"))
+    real = np.load(os.path.join(args.data_dir, "key.npy"))
+
+    if args.ntraces is not None:
+        traces = traces[:args.ntraces]
+        plaintexts = plaintexts[:args.ntraces]
+        print(f"using the first {len(traces)} traces")
     print(f"loaded {traces.shape[0]} traces of {traces.shape[1]} samples")
 
     recovered = recover_key(traces, plaintexts)
-    write_key_report(recovered, real)
-    plot_correlation(traces, plaintexts, real)
-    plot_traces_needed(traces, plaintexts, real)
+    write_key_report(recovered, real, args.results_dir)
+    if not args.no_plots:
+        plot_correlation(traces, plaintexts, real, args.results_dir)
+        plot_traces_needed(traces, plaintexts, real, args.results_dir)
     print("done")
 
 

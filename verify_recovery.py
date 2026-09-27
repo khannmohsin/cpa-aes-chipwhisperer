@@ -17,39 +17,12 @@ Run several keys to be convinced it is not a fluke.
 """
 
 import numpy as np
-from tqdm import tqdm
-from Crypto.Cipher import AES          # independent AES, unrelated to ChipWhisperer
 
-import chipwhisperer as cw
-from capture import connect, flash_firmware
-from attack import recover_key
+from capture import connect, flash_firmware, capture_pairs
+from attack import recover_key, confirms_device
 
 NUM_KEYS       = 3       # how many keys to check this way
 TRACES_PER_KEY = 100
-
-
-def capture_pairs(scope, target, key, n):
-    """Record traces and keep the chip's own ciphertext (textout) for each."""
-    traces, plaintexts, ciphertexts = [], [], []
-    for i in range(n):
-        text = bytearray(np.random.randint(0, 256, 16, dtype=np.uint8).tolist())
-        trace = cw.capture_trace(scope, target, text, key, always_send_key=(i == 0))
-        if trace is None:
-            continue
-        traces.append(trace.wave)
-        plaintexts.append(list(trace.textin))
-        ciphertexts.append(bytes(trace.textout))     # what the hardware output
-    return np.array(traces), np.array(plaintexts, dtype=np.uint8), ciphertexts
-
-
-def check_key(recovered, plaintexts, device_ciphertexts):
-    """Does the recovered key reproduce the device's real ciphertexts?"""
-    cipher = AES.new(bytes(recovered), AES.MODE_ECB)   # separate AES engine
-    for pt, ct_device in zip(plaintexts, device_ciphertexts):
-        ct_software = cipher.encrypt(bytes(pt))
-        if ct_software != ct_device:
-            return False
-    return True
 
 
 def main():
@@ -62,7 +35,7 @@ def main():
             traces, plaintexts, cts = capture_pairs(scope, target, key, TRACES_PER_KEY)
             recovered = recover_key(traces, plaintexts)
 
-            matches_device = check_key(recovered, plaintexts, cts)
+            matches_device = confirms_device(recovered, plaintexts, cts)
             # We also print the true key just so you can eyeball it, but the proof
             # above does not depend on knowing it.
             print(f"\nkey {k}")

@@ -11,19 +11,15 @@ At the end it prints how many of the keys were fully recovered and writes a
 summary to results/multikey_summary.txt.
 
 This reuses:
-  - connect() and flash_firmware() from capture.py
-  - recover_key()               from attack.py
+  - connect(), flash_firmware() and capture_pairs() from capture.py
+  - recover_key() and confirms_device()       from attack.py
 """
 
 import os
 import numpy as np
-from tqdm import tqdm
 
-from Crypto.Cipher import AES                         # independent AES, for the check
-
-import chipwhisperer as cw
-from capture import connect, flash_firmware          # board setup
-from attack import recover_key                        # the CPA itself
+from capture import connect, flash_firmware, capture_pairs   # board setup
+from attack import recover_key, confirms_device               # the CPA + check
 
 # ---------------------------------------------------------------------------
 # Settings
@@ -36,47 +32,16 @@ GAIN           = 25
 RESULTS_DIR = "results"
 
 
-def capture_for_key(scope, target, key, n):
-    """Record n traces of random plaintexts, all encrypted under `key`.
-
-    We also keep the chip's own ciphertext (textout) for the independent check.
-    """
-    traces, plaintexts, ciphertexts = [], [], []
-    for i in range(n):
-        text = bytearray(np.random.randint(0, 256, 16, dtype=np.uint8).tolist())
-        # always_send_key on the first trace makes sure the target loads our key.
-        trace = cw.capture_trace(scope, target, text, key,
-                                 always_send_key=(i == 0))
-        if trace is None:
-            continue
-        traces.append(trace.wave)
-        plaintexts.append(list(trace.textin))
-        ciphertexts.append(bytes(trace.textout))   # what the hardware actually output
-    return np.array(traces), np.array(plaintexts, dtype=np.uint8), ciphertexts
-
-
-def confirms_device(recovered, plaintexts, device_ciphertexts):
-    """Independent check: does the recovered key reproduce the chip's ciphertexts?
-
-    This trusts neither our stored key nor our CPA code. It encrypts each
-    plaintext with the recovered key using a separate AES library and compares
-    to what the hardware really output.
-    """
-    cipher = AES.new(bytes(recovered), AES.MODE_ECB)
-    for pt, ct_device in zip(plaintexts, device_ciphertexts):
-        if cipher.encrypt(bytes(pt)) != ct_device:
-            return False
-    return True
-
-
 def main():
+    from tqdm import tqdm
+
     scope, target = connect()
     results = []                      # (key_hex, recovered_hex, bytes_correct, confirmed)
     try:
         flash_firmware(scope)
         for k in tqdm(range(NUM_KEYS), desc="keys"):
             key = bytearray(np.random.randint(0, 256, 16, dtype=np.uint8).tolist())
-            traces, plaintexts, cts = capture_for_key(scope, target, key, TRACES_PER_KEY)
+            traces, plaintexts, cts = capture_pairs(scope, target, key, TRACES_PER_KEY)
             if len(traces) == 0:
                 print(f"key {k}: no traces captured, skipping")
                 continue

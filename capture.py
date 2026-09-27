@@ -10,14 +10,20 @@ Steps:
   3. Choose one fixed secret key and many random plaintexts.
   4. For each plaintext, ask the target to encrypt it and record the power used.
   5. Save everything to the data/ folder.
+
+The chipwhisperer SDK is imported lazily, inside the functions that need the
+hardware, so `import capture` works even on machines without it installed
+(capture_pairs() is reused by the verification scripts for this reason).
 """
 
 import os
 import sys
 import importlib
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
-# Settings you may want to change
+# Settings you may want to change (or pass as command-line flags)
 # ---------------------------------------------------------------------------
 NUM_TRACES  = 200      # how many encryptions to record
 NUM_SAMPLES = 5000     # samples per trace (covers the first AES round)
@@ -45,18 +51,10 @@ def print_versions():
             sys.exit(1)
 
 
-# Import the packages only after we know they are there.
-print_versions()
-import numpy as np
-import matplotlib
-matplotlib.use("Agg")                   # draw plots to files, no window needed
-import matplotlib.pyplot as plt
-from tqdm import tqdm
-import chipwhisperer as cw
-
-
-def connect():
+def connect(gain=GAIN, samples=NUM_SAMPLES):
     """Step 1: find the ChipWhisperer and connect to the scope and target."""
+    import chipwhisperer as cw
+
     print("Step 1: connecting to the ChipWhisperer-Lite")
     try:
         scope = cw.scope()
@@ -66,26 +64,31 @@ def connect():
         sys.exit(1)
 
     scope.default_setup()               # sensible clock, trigger and serial settings
-    scope.gain.db = GAIN                # amplify the tiny power signal
-    scope.adc.samples = NUM_SAMPLES     # how many points to record per trace
+    scope.gain.db = gain                # amplify the tiny power signal
+    scope.adc.samples = samples         # how many points to record per trace
     target = cw.target(scope)           # serial link to the XMEGA
-    print(f"  connected (gain = {GAIN} dB, samples = {NUM_SAMPLES})")
+    print(f"  connected (gain = {gain} dB, samples = {samples})")
     return scope, target
 
 
-def flash_firmware(scope):
+def flash_firmware(scope, firmware_path=FIRMWARE_PATH):
     """Step 2: load the plain (unprotected) AES program onto the XMEGA."""
+    import chipwhisperer as cw
+
     print("Step 2: flashing the AES firmware")
-    if not os.path.exists(FIRMWARE_PATH):
-        print(f"\n  Firmware not found at {FIRMWARE_PATH}")
+    if not os.path.exists(firmware_path):
+        print(f"\n  Firmware not found at {firmware_path}")
         print("  Build it first (see README.md, 'Build the firmware').\n")
         sys.exit(1)                     # main() still disconnects cleanly
-    cw.program_target(scope, cw.programmers.XMEGAProgrammer, FIRMWARE_PATH)
+    cw.program_target(scope, cw.programmers.XMEGAProgrammer, firmware_path)
     print("  firmware flashed")
 
 
 def record_traces(scope, target):
     """Steps 3 and 4: fixed key, random plaintexts, record one trace per encryption."""
+    import chipwhisperer as cw
+    from tqdm import tqdm
+
     print("Step 3: choosing one fixed key and random plaintexts")
     ktp = cw.ktp.Basic()                # ChipWhisperer's key/plaintext generator:
                                         # fixed key by default, random plaintext each time
@@ -108,6 +111,28 @@ def record_traces(scope, target):
     return np.array(traces), np.array(plaintexts, dtype=np.uint8), np.array(list(key), dtype=np.uint8)
 
 
+def capture_pairs(scope, target, key, n):
+    """Record n traces of random plaintexts, all encrypted under `key`.
+
+    We also keep the chip's own ciphertext (textout) for the independent
+    verification checks in cpa_multikey.py and verify_recovery.py.
+    """
+    import chipwhisperer as cw
+
+    traces, plaintexts, ciphertexts = [], [], []
+    for i in range(n):
+        text = bytearray(np.random.randint(0, 256, 16, dtype=np.uint8).tolist())
+        # always_send_key on the first trace makes sure the target loads our key.
+        trace = cw.capture_trace(scope, target, text, key,
+                                 always_send_key=(i == 0))
+        if trace is None:
+            continue
+        traces.append(trace.wave)
+        plaintexts.append(list(trace.textin))
+        ciphertexts.append(bytes(trace.textout))   # what the hardware actually output
+    return np.array(traces), np.array(plaintexts, dtype=np.uint8), ciphertexts
+
+
 def save_data(traces, plaintexts, key):
     """Steps 5 and 6: save the numbers, plus a human-readable log."""
     print("Step 5: saving traces.npy, plaintexts.npy, key.npy")
@@ -126,6 +151,11 @@ def save_data(traces, plaintexts, key):
 
 def plot_one_trace(traces):
     """Step 7: plot a single trace so we can see the AES round structure."""
+    import matplotlib
+
+    matplotlib.use("Agg")                   # draw plots to files, no window needed
+    import matplotlib.pyplot as plt
+
     print("Step 7: saving one_trace.png")
     os.makedirs(RESULTS_DIR, exist_ok=True)
     plt.figure(figsize=(10, 4), facecolor="white")
@@ -138,10 +168,30 @@ def plot_one_trace(traces):
     plt.close()
 
 
-def main():
-    scope, target = connect()
+def parse_args(argv=None):
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Record AES-128 power traces from a "
+                    "ChipWhisperer-Lite + XMEGA target.",
+    )
+    parser.add_argument("--traces", type=int, default=NUM_TRACES,
+                        help=f"how many encryptions to record (default: {NUM_TRACES})")
+    parser.add_argument("--samples", type=int, default=NUM_SAMPLES,
+                        help=f"samples per trace (default: {NUM_SAMPLES})")
+    parser.add_argument("--gain", type=float, default=GAIN,
+                        help=f"amplifier gain in dB (default: {GAIN})")
+    parser.add_argument("--firmware", default=FIRMWARE_PATH,
+                        help="path to the compiled AES firmware .hex file")
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    print_versions()
+    scope, target = connect(gain=args.gain, samples=args.samples)
     try:
-        flash_firmware(scope)
+        flash_firmware(scope, args.firmware)
         traces, plaintexts, key = record_traces(scope, target)
         save_data(traces, plaintexts, key)
         plot_one_trace(traces)
